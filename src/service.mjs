@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { appHome } from "./config.mjs";
 
 export const SERVICE_LABEL = "io.github.codex-bridge-antigravity.daemon";
+const WINDOWS_TASK = "CodexAntigravityBridge";
+const windowsLauncher = fileURLToPath(new URL("../bin/bridge-service.exe", import.meta.url));
 
 function launchAgentsDir() {
   return join(homedir(), "Library", "LaunchAgents");
@@ -89,6 +91,40 @@ export function buildServicePlist(config) {
 }
 
 export function installService(config) {
+  if (process.platform === "win32") {
+    const logDir = join(appHome(), "logs");
+    mkdirSync(logDir, { recursive: true });
+    const ps = value => `'${String(value).replaceAll("'", "''")}'`;
+    const supervisorPath = fileURLToPath(new URL("./supervisor.mjs", import.meta.url));
+    const installDirectory = fileURLToPath(new URL("../", import.meta.url));
+    if (!existsSync(windowsLauncher)) throw new Error("Install the Windows launcher with scripts/install-windows.ps1 or build it with scripts/build-windows-launcher.ps1");
+    const install = `$ErrorActionPreference = 'Stop'
+$task = '${WINDOWS_TASK}'
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$action = New-ScheduledTaskAction -Execute ${ps(windowsLauncher)} -Argument ${ps(`"${process.execPath}" "${supervisorPath}" "${appHome()}"`)} -WorkingDirectory ${ps(installDirectory)}
+$existing = Get-ScheduledTask -TaskName $task -TaskPath '\\' -ErrorAction SilentlyContinue
+if ($existing) {
+    if ($existing.Actions.Count -ne 1 -or $existing.Actions[0].Execute -ne $action.Execute -or $existing.Actions[0].Arguments -ne $action.Arguments) {
+        throw "The existing $task belongs to another installation. Disconnect it from its original checkout first."
+    }
+} else {
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
+    $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    Register-ScheduledTask -TaskName $task -TaskPath '\\' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description 'Codex Antigravity Bridge' | Out-Null
+}
+try {
+    if (!$existing -or $existing.State -ne 'Running') { Start-ScheduledTask -TaskName $task -TaskPath '\\' }
+} catch {
+    if (!$existing) { Unregister-ScheduledTask -TaskName $task -TaskPath '\\' -Confirm:$false }
+    throw
+}
+if (!$existing) { 'registered' }
+`;
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-EncodedCommand", Buffer.from(install, "utf16le").toString("base64")], { encoding: "utf8", windowsHide: true });
+    if (result.status !== 0) throw new Error(`Cannot register Windows startup task: ${result.error?.message || result.stderr || result.stdout}`);
+    return { installed: true, taskName: WINDOWS_TASK, installDirectory, newlyRegistered: result.stdout.trim() === "registered" };
+  }
   if (process.platform !== "darwin") return { installed: false, reason: "macOS only" };
   const plistPath = servicePlistPath();
   const logDir = join(appHome(), "logs");
@@ -107,6 +143,18 @@ export function installService(config) {
 }
 
 export function uninstallService() {
+  if (process.platform === "win32") {
+    const remove = `$ErrorActionPreference = 'Stop'
+$task = Get-ScheduledTask -TaskName '${WINDOWS_TASK}' -TaskPath '\\' -ErrorAction SilentlyContinue
+if ($task -and $task.Actions.Count -eq 1 -and $task.Actions[0].Execute -eq '${windowsLauncher.replaceAll("'", "''")}') {
+    Stop-ScheduledTask -InputObject $task
+    Unregister-ScheduledTask -InputObject $task -Confirm:$false
+}
+`;
+    const result = spawnSync("powershell.exe", ["-NoProfile", "-EncodedCommand", Buffer.from(remove, "utf16le").toString("base64")], { encoding: "utf8", windowsHide: true });
+    if (result.status !== 0) throw new Error(`Cannot remove Windows startup task: ${result.error?.message || result.stderr || result.stdout}`);
+    return { removed: true, taskName: WINDOWS_TASK };
+  }
   if (process.platform !== "darwin") return { removed: false, reason: "macOS only" };
   const user = uid();
   if (user) launchctl(["bootout", `gui/${user}/${SERVICE_LABEL}`]);

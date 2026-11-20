@@ -40,6 +40,7 @@ export function defaultConfig(overrides = {}) {
     host: DEFAULT_HOST,
     port: DEFAULT_PORT,
     cwd: process.cwd(),
+    allowedWorkspaceRoots: [overrides.cwd || process.cwd()],
     mode: DEFAULT_MODE,
     agyPath: process.env.AGY_PATH?.trim() || "agy",
     nativeBaseUrl: process.env.CODEX_NATIVE_BASE_URL?.trim() || DEFAULT_NATIVE_BASE_URL,

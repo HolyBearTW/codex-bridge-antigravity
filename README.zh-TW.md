@@ -1,172 +1,52 @@
-# codex-bridge-antigravity
+# 在 Windows Codex 加入 Gemini 模型
 
-[English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
+[English](README.md)
 
-輕量級本機 OpenAI Responses API 橋接器，將 Google Antigravity 官方 CLI (`agy`) 無縫整合至 OpenAI Codex（支援 Desktop 與 CLI），同時完整保留原生 GPT 模型的路由與認證機制。
+這是 [Jakevin 原專案](https://github.com/Jakevin/codex-bridge-antigravity) 的 Windows x64 版本。使用自己的 ChatGPT 和 Google 帳號，就能從同一個 Codex 模型選單切換 GPT 與 Antigravity 提供的 Gemini。這個版本包含登入自啟、背景服務自動復原、推理等級切換、對話增量接續、圖片輸入與本機用量頁。檔案和指令操作由 Codex 依目前工作區與審批設定執行。
 
-![Codex 模型選單顯示原生 GPT 與 Antigravity 模型](assets/model-selector.png)
+## 可以貼給 Codex 的提示詞
 
----
+```text
+請在我的 Windows x64 電腦安裝 https://github.com/HolyBearTW/codex-bridge-antigravity 的 Gemini 橋接器，讓 Codex 模型選單同時顯示原生 GPT 與我的 Antigravity 帳號可用的 Gemini。
 
-## 專案概述
+請先讀 README.zh-TW.md，確認 Git、Node.js 22.15+、Codex 和官方 Antigravity CLI（agy）可用。需要登入時請讓我在官方視窗登入自己的 ChatGPT 或 Google 帳號，再繼續。
 
-OpenAI Codex 的 WebSocket 與 HTTP 端點設定屬於 **Provider 層級**（供應商層級），而非個別模型層級。因此，`codex-bridge-antigravity` 在本機建立了一套智慧反向路由器：
-
-- **原生 GPT / Codex 模型**：原樣轉發給官方 ChatGPT / Codex 後端，沿用您 Codex 現有的 Bearer 登入憑證與 Session。
-- **Antigravity 模型（`antigravity/*`）**：由本機路由器攔截，轉譯為官方 `agy` CLI 命令並以 `stream-json` 事件串流方式執行，再包裝回標準 OpenAI Responses SSE/WebSocket 格式。
-
-這讓您在同一個工作區與同一個 Codex 模型選單中，能自由且無縫地在 GPT 與 Gemini 模型間切換。
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Codex Client                         │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-                               ▼ (Provider 路由: 127.0.0.1:17842)
-┌─────────────────────────────────────────────────────────────┐
-│                  codex-bridge-antigravity                   │
-│                                                             │
-│   ┌───────────────────────────┐   ┌─────────────────────┐   │
-│   │   原生 GPT / Codex 模型   │   │   antigravity/*     │   │
-│   └─────────────┬─────────────┘   └──────────┬──────────┘   │
-└─────────────────┼────────────────────────────┼──────────────┘
-                  │                            │
-                  ▼                            ▼
-┌──────────────────────────────────┐   ┌──────────────────────┐
-│  官方 OpenAI/ChatGPT 後端        │   │ Google Antigravity   │
-│  (原生 Bearer Token 透傳)        │   │ 官方 CLI (`agy`)     │
-└──────────────────────────────────┘   └──────────────────────┘
+請把倉庫 clone 到固定目錄，以我目前的專案作為 -Workspace，執行 scripts/install-windows.ps1。沿用我的 Codex 權限設定。若已設定另一套代理，請先回報衝突並保留原設定。安裝後驗證 /healthz 與 AGY 模型清單，告訴我備份位置，並提醒我重啟 Codex、從模型選單切換 GPT → Gemini → GPT。
 ```
 
----
+## 手動安裝
 
-## 主要特點
+1. 準備 Windows x64、Git、Node.js 22.15 以上。先在本機 Codex Desktop 或 CLI 用自己的 ChatGPT 帳號登入。
+2. 安裝官方 `agy`。在工作區啟動 `agy` 並完成 Google 帳號登入，再用 `agy models` 確認有哪些模型可用。[Google Antigravity CLI 安裝說明](https://antigravity.google/docs/getting-started?tab=cli)
+3. 在 PowerShell 執行以下命令，把範例工作區換成你要用的既有專案資料夾。安裝後保留這個 clone，排程會從這裡載入程式。
 
-- **零干擾雙向共存**：原生 GPT 模型依舊直連官方後端，完全不會被傳入 Antigravity。
-- **動態模型目錄同步**：自動從 `agy models` 即時讀取可用模型（如 Gemini 3.8 Flash、Gemini 3.8 Pro）。
-- **修復 Codex 切換模型錯誤**：修正模型目錄中的 `use_responses_lite = false`，徹底解決切換到 Antigravity 模型時 Codex 前端帳號驗證崩潰的問題。
-- **對話歷程壓縮（Compaction）**：完整實作 `/v1/responses/compact` 端點，符合 OpenAI Compact API 規格，對話過長時能自動完成摘要總結。
-- **一鍵安裝與安全復原**：`setup` 自動備份並設定 `~/.codex/config.toml`；隨時可透過 `disconnect` 指令完全還原。
+```powershell
+git clone https://github.com/HolyBearTW/codex-bridge-antigravity.git
+Set-Location codex-bridge-antigravity
+powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File .\scripts\install-windows.ps1 -Workspace 'C:\Projects\my-project'
+```
 
-### 圖片輸入
+安裝程式會比對 GitHub Release 中 Windows 啟動器的 SHA-256，將 `CodexAntigravityBridge` 註冊為目前使用者登入時啟動的排程，並在服務健康後寫入 Codex 的本機路由。預設使用 `127.0.0.1:17842`，可用 `-Port` 另選連接埠。啟動器尚無 Authenticode 簽章，也可依英文 README 的指示自行編譯。
 
-Antigravity 模型路由會宣告 `input_modalities: ["text", "image"]`。本機圖片會以私有副本存放於 `~/.codex-bridge-antigravity/cache/images`，讓 `agy` 能讀取，並在主要回合前執行必要的讀圖預檢。橋接器支援 `data:image/...;base64,...`、`file://...`、本機檔案路徑與 HTTPS 圖片 URL；原生 GPT 路由維持不變。
+## 驗證與使用
 
----
-
-## 前置需求
-
-- **Node.js**：`>= 22.0.0`
-- **Google Antigravity CLI (`agy`)**：已安裝並完成官方帳號登入（執行 `agy models` 需能列出模型）。
-- **OpenAI Codex**：已安裝 Codex Desktop 或 Codex CLI。
-
----
-
-## 快速開始
-
-### 1. 檢測與診斷
-
-複製此專案並檢測本機環境：
-
-```bash
-git clone https://github.com/Jakevin/codex-bridge-antigravity.git
-cd codex-bridge-antigravity
-
-# 執行自動化回歸測試
-npm test
-
-# 診斷 agy 與 Codex 本機設定路徑
+```powershell
+Invoke-RestMethod http://127.0.0.1:17842/healthz | Select-Object ok, agy_workspace_ok, model_count
 node src/cli.mjs doctor
 ```
 
-### 2. 啟動本機守護程序（Daemon）
+看到 `ok` 和 `agy_workspace_ok` 都是 `True`，且 `model_count` 大於零後，重啟 Codex。Desktop 可直接打開模型選單，CLI 可輸入 `/model`。用一段測試對話確認 GPT → Gemini → GPT 的切換。Gemini 名稱、推理等級和額度以 `agy models` 與你的 Google 帳號為準。用量頁位於 `http://127.0.0.1:17842/usage`。
 
-啟動橋接伺服器（預設監聽連接埠 `17842`）：
+同一聊天切換到 Gemini 時，橋接器會把接續所需的對話內容傳給 Google Antigravity。GPT 請求由原有的 ChatGPT 帳號驗證並送往 OpenAI。這是社群整合，兩邊都使用各自帳號的額度。
 
-```bash
-node src/cli.mjs serve --cwd "$PWD"
-```
+## 還原
 
-在另一個終端機視窗測試端點：
+從原來的 clone 執行以下命令，然後重啟 Codex。
 
-```bash
-# 健康檢查
-curl http://127.0.0.1:17842/healthz
-
-# 查詢模型目錄
-curl http://127.0.0.1:17842/v1/models
-
-# 測試生成回答
-curl http://127.0.0.1:17842/v1/responses \
-  -H 'content-type: application/json' \
-  -d '{"model":"antigravity/gemini-3.8-flash-low","input":"Reply with exactly AGY_OK"}'
-```
-
-### 3. 整合至 Codex
-
-將橋接器寫入 Codex 設定檔中：
-
-```bash
-node src/cli.mjs setup --cwd "$PWD" --replace-codex-route
-```
-
-重新啟動 Codex Desktop 應用程式或重新開啟 Codex CLI。現在模型選單中除了原生的 GPT 模型外，還會出現 `Gemini 3.8 Flash ...` 模型可供選取。
-
-### 4. 取消整合與還原
-
-若想還原至執行 `setup` 前的 Codex 設定，隨時執行：
-
-```bash
+```powershell
 node src/cli.mjs disconnect
 ```
 
----
+此指令會還原安裝前的 `config.toml` 並移除本專案的背景排程。預設備份位於 `~/.codex-bridge-antigravity/codex/config.toml.before-antigravity`。若安裝後有調整過 Codex 設定，先另存目前的 `config.toml`，還原後可把需要的調整加回。橋接器日誌位於 `~/.codex-bridge-antigravity/logs/`。
 
-## 執行模式
-
-執行 `serve` 時，可透過 `--mode` 指定 AGY 的工作模式：
-
-- **`accept-edits`（預設）**：AGY 會在指定工作區內自動執行其程式修改與工具呼叫。
-- **`plan`（唯讀規劃模式）**：僅進行規劃與診斷，不更動工作區檔案：
-  ```bash
-  node src/cli.mjs serve --cwd "$PWD" --mode plan
-  ```
-
----
-
-## 環境變數與設定檔
-
-設定檔案預設存放在 `~/.codex-bridge-antigravity/`。
-
-可透過下列環境變數自訂路徑與連接埠：
-
-| 環境變數 | 說明 | 預設值 |
-|---|---|---|
-| `PORT` | 橋接器 HTTP/WebSocket 連接埠 | `17842` |
-| `AGY_PATH` | 官方 `agy` 執行檔路徑 | 自動從 `$PATH` 搜尋 |
-| `CODEX_HOME` | Codex 設定目錄 | `~/.codex` |
-| `CODEX_ANTIGRAVITY_HOME` | 橋接器狀態存放目錄 | `~/.codex-bridge-antigravity` |
-
----
-
-## 常見問題與排除
-
-- **Codex 切換模型時報錯 (`use_responses_lite`)**：本版本已將模型規格中的 `use_responses_lite` 設為 `false`，避免 Codex upstream 驗證被拒絕。
-- **連接埠衝突**：若 `17842` 已被其他本機代理（如 Freebuff 或其他服務）佔用，可指定 `PORT=17845 node src/cli.mjs serve`，並重新執行 `setup`。
-- **AGY 授權失效**：若收到認證錯誤，請在終端機執行 `agy auth` 於瀏覽器中重新授權 Google 帳號。
-
----
-
-## 合規與免責聲明
-
-`codex-bridge-antigravity` 是一個獨立、非商業性的個人本機開發輔助工具，旨在供開發者於本機 (`localhost`) 串接自己已獲官方授權之帳號與憑證。
-
-- 本專案與 OpenAI 或 Google 無官方隸屬、背書或贊助關係。
-- 透過橋接器傳送的所有請求，均使用使用者自己的憑證與配額。
-- 請勿將本工具用於多租戶公開架設、轉售服務、或違反平台服務條款之未授權模型蒸餾與擷取行為。
-
----
-
-## 授權條款
-
-本專案採用 [MIT License](LICENSE) 授權 © 2026 Jakevin
+[MIT 授權](LICENSE) · [上游專案](https://github.com/Jakevin/codex-bridge-antigravity)

@@ -1,5 +1,7 @@
 # codex-bridge-antigravity
 
+このページはアップストリームのドキュメントです。Windows x64 版については、[インストールガイド](README.md)を参照してください。
+
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 公式 Google Antigravity CLI (`agy`) を OpenAI Codex（Desktop および CLI）にシームレスに統合し、ネイティブ GPT モデルのルーティングと認証をそのまま維持する軽量ローカル OpenAI Responses API ブリッジです。

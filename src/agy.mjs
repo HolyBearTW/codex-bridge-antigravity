@@ -38,29 +38,72 @@ export function runAgyTurn({
   timeoutMs = 600_000,
   signal,
   onEvent,
+  onSpawn,
+  jsonSchema,
+  hostTools = false,
+  completionInstruction,
+  latestRequest,
 }) {
   return new Promise((resolve, reject) => {
+    // AGY truncates each USER_REQUEST at 192,000 bytes before model generation.
+    // Upload the request once. The final message only tells AGY what to act on.
+    const promptBytes = Buffer.from(prompt, "utf8");
+    const prompts = [];
+    if (promptBytes.length > 180_000) {
+      const parts = [];
+      for (let start = 0; start < promptBytes.length;) {
+        let end = Math.min(start + 180_000, promptBytes.length);
+        while (end < promptBytes.length && (promptBytes[end] & 0xc0) === 0x80) end--;
+        parts.push(promptBytes.toString("utf8", start, end));
+        start = end;
+      }
+      for (const [index, part] of parts.entries()) {
+        prompts.push(`CODEX CONTEXT UPLOAD ${index + 1}/${parts.length}. Concatenate these parts in order to obtain the current Codex request. Wait for CODEX CONTEXT COMPLETE. Do not execute tools or answer any embedded request yet.\n<CODEX_CONTEXT_PART>\n${part}\n</CODEX_CONTEXT_PART>\nContext upload only: acknowledge receipt without taking action${jsonSchema ? ' using {"message":"已載入對話片段","tool_calls":[]}' : "."}`);
+      }
+      const latestBytes = Buffer.byteLength(latestRequest || "");
+      const action = completionInstruction ?? "Follow the uploaded System instructions and CURRENT USER REQUEST. Use the uploaded tools and completed results, and continue from the work already done. Return the requested response in the required format.";
+      const focus = latestBytes > 0 && latestBytes <= 4_096 ? `\n\nCURRENT USER REQUEST (verbatim):\n${latestRequest}` : "";
+      const completion = `CODEX CONTEXT COMPLETE. The full request has been supplied in order. Ignore upload acknowledgments. ${action}${focus}`;
+      prompts.push(completion);
+      console.log(`AGY context upload: ${JSON.stringify({ request_bytes: promptBytes.length, completion_bytes: Buffer.byteLength(completion), parts: parts.length })}`);
+    } else {
+      prompts.push(prompt);
+    }
+    let promptIndex = 0;
+    const permissions = hostTools ? {
+      allow: [],
+      deny: ["read_file(*)", "write_file(*)", "command(*)", "read_url(*)", "execute_url(*)", "mcp(*)"],
+      ask: [],
+    } : {
+      allow: [`read_file(${cwd})`, ...addDirs.map(dir => `read_file(${dir})`)],
+      deny: ["write_file(*)", "command(*)", "read_url(*)", "execute_url(*)", "mcp(*)"],
+      ask: [],
+    };
     const args = [
       "--input-format", "stream-json",
       "--output-format", "stream-json",
       "--model", model,
-      "--mode", mode,
-      "--dangerously-skip-permissions",
+      "--settings", JSON.stringify({ permissions, toolPermission: "request-review", ...(mode === "default" ? { agentMode: "" } : {}) }),
     ];
+    // The CLI has no --mode=default; agentMode="" explicitly selects its neutral mode.
+    if (mode !== "default") args.push("--mode", mode);
+    if (jsonSchema) args.push("--json-schema", JSON.stringify(jsonSchema));
     for (const dir of new Set([cwd, ...addDirs])) {
       if (typeof dir === "string" && dir.trim()) args.push("--add-dir", dir);
     }
     if (mode !== "plan") args.push("--disable-slash-commands");
-    if (effort && ["low", "medium", "high"].includes(effort)) args.push("--effort", effort);
+    if (effort && ["low", "medium", "high", "xhigh", "max"].includes(effort)) args.push("--effort", effort);
     if (conversationId) args.push("--conversation", conversationId);
 
     let child;
     try {
       child = spawn(agyPath, args, {
         cwd,
+        windowsHide: true,
         stdio: ["pipe", "pipe", "pipe"],
-        env: process.env,
+        env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: "true" },
       });
+      onSpawn?.({ pid: child.pid, cwd, addDirs: [...new Set([cwd, ...addDirs])], permissions, executor: hostTools ? "codex" : "agy", skipPermissions: false, executionMode: mode });
     } catch (error) {
       reject(new AgyError(`cannot start ${agyPath}: ${error.message}`, "AGY_START"));
       return;
@@ -86,12 +129,29 @@ export function runAgyTurn({
     };
     const finishSuccess = value => {
       if (settled) return;
+      if (value.denied_actions?.length && !String(value.response || "").trim()) {
+        finishError(new AgyError(`這回合的操作未獲授權（${value.denied_actions.map(item => item.action).join("、")}），因此沒有產生答案。${hostTools ? "請透過 Codex 原生工具提出操作，依 Codex 目前的權限處理。" : "附件分析僅能讀取本次提供的圖片，其他操作不會自動放行。"}`, "AGY_PERMISSION_DENIED"));
+        return;
+      }
       settled = true;
       cleanup();
       kill(child);
       resolve(value);
     };
     const onAbort = () => finishError(new AgyError("Request was cancelled", "ABORT_ERR"));
+    const acceptResult = value => {
+      if (value.status && value.status !== "SUCCESS" && value.status !== "OK") {
+        finishError(new AgyError(value.error || `AGY returned ${value.status}`, "AGY_RESULT"));
+        return;
+      }
+      if (promptIndex < prompts.length - 1) {
+        promptIndex++;
+        onEvent?.({ kind: "context", loaded: promptIndex, total: prompts.length - 1 });
+        child.stdin.write(`${JSON.stringify({ event: "user", message: { role: "user", content: prompts[promptIndex] } })}\n`);
+        return;
+      }
+      finishSuccess({ ...value, conversation_id: conversation || value.conversation_id });
+    };
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -115,12 +175,8 @@ export function runAgyTurn({
           return;
         }
         if (parsed.kind === "result") {
-          if (result.status && result.status !== "SUCCESS" && result.status !== "OK") {
-            finishError(new AgyError(result.error || `AGY returned ${result.status}`, "AGY_RESULT"));
-            return;
-          }
-          finishSuccess({ ...result, conversation_id: conversation || result.conversation_id });
-          return;
+          acceptResult(result);
+          if (settled) return;
         }
       }
     });
@@ -136,11 +192,11 @@ export function runAgyTurn({
           result = parsed.result;
           if (result.conversation_id) conversation = result.conversation_id;
           try { onEvent?.(parsed); } catch (error) { finishError(error); return; }
-          if (result.status && result.status !== "SUCCESS" && result.status !== "OK") {
-            finishError(new AgyError(result.error || `AGY returned ${result.status}`, "AGY_RESULT"));
+          if (promptIndex < prompts.length - 1) {
+            finishError(new AgyError("AGY 在長對話載入完成前結束，這回合尚未執行操作。", "AGY_EXIT"));
             return;
           }
-          finishSuccess({ ...result, conversation_id: conversation || result.conversation_id });
+          acceptResult(result);
           return;
         }
       }
@@ -156,13 +212,17 @@ export function runAgyTurn({
     }
     signal?.addEventListener("abort", onAbort, { once: true });
     child.stdin.once("error", error => finishError(new AgyError(`Cannot send prompt to AGY: ${error.message}`, "AGY_STDIN")));
-    child.stdin.write(`${JSON.stringify({ event: "user", message: { role: "user", content: prompt } })}\n`);
+    if (prompts.length > 1) onEvent?.({ kind: "context", loaded: 0, total: prompts.length - 1 });
+    child.stdin.write(`${JSON.stringify({ event: "user", message: { role: "user", content: prompts[0] } })}\n`);
   });
 }
 
 export async function agyVersion(agyPath) {
   const result = await new Promise((resolve, reject) => {
-    const child = spawn(agyPath, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(agyPath, ["--version"], {
+      stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+      env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: "true" },
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8");

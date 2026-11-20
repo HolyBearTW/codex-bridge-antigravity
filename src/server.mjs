@@ -1,21 +1,33 @@
 import { createServer } from "node:http";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { getAgyUsage } from "./usage.mjs";
 import * as zlib from "node:zlib";
 import {
-  AGY_AUTO_COMPACT_TOKEN_LIMIT,
-  AGY_CONTEXT_WINDOW,
   agyModelId,
+  buildCodexCatalog,
+  discoverAgyModels,
+  groupAgyModels,
   isAntigravityModel,
   isLegacyBridgeModel,
   routeId,
 } from "./models.mjs";
-import { buildAgyPrompt, encodeCompactionSummary, hasImageInput, imageCacheDir, scrubBridgeArtifactsForNative } from "./prompt.mjs";
+import { buildAgyPrompt, currentVisualInput, encodeCompactionSummary, hasImageInput, imageCacheDir, itemText, latestUserMessage, scrubBridgeArtifactsForNative } from "./prompt.mjs";
 import { AgyError, runAgyTurn } from "./agy.mjs";
+import { codexTools, HOST_RESPONSE_SCHEMA, parseHostResponse } from "./host-tools.mjs";
+import { createWorkspacePolicy } from "./workspace.mjs";
+import { BridgeLifecycle } from "./lifecycle.mjs";
 import { fetchNative, nativeWebSocketHeaders, nativeWebSocketUrl, pipeNativeResponse } from "./native.mjs";
 
 const MAX_ENCODED_BODY_BYTES = 64 * 1024 * 1024;
 const MAX_DECODED_BODY_BYTES = 128 * 1024 * 1024;
+
+function isLocalRequest(req) {
+  const host = req.headers.host?.toLowerCase() || "";
+  return /^(127\.0\.0\.1|localhost|\[::1\])(?::\d+)?$/.test(host)
+    && !["cross-site", "same-site"].includes(req.headers["sec-fetch-site"])
+    && (!req.headers.origin || req.headers.origin === `http://${host}`);
+}
 
 function json(res, status, value) {
   const body = JSON.stringify(value);
@@ -23,7 +35,6 @@ function json(res, status, value) {
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(body),
     "cache-control": "no-store",
-    "access-control-allow-origin": "*",
   });
   res.end(body);
 }
@@ -122,11 +133,9 @@ export function expandPreviousResponse(payload, responseStates, { native = false
   if (!previousId) return payload;
 
   const isPreviousAgy = conversations?.has(previousId);
+  const isWarmup = previousId.startsWith("resp_agy_warmup_");
   // If target is native and previous was also native -> OpenAI upstream already has the session state
-  if (native && !isPreviousAgy) return payload;
-  // If target is antigravity and previous was also antigravity -> AGY CLI tracks session via conversationId
-  if (!native && isPreviousAgy) return payload;
-
+  if (native && !isPreviousAgy && !isWarmup) return payload;
   const state = responseStates.get(previousId);
   if (!state) return payload;
   const expanded = {
@@ -140,38 +149,17 @@ export function expandPreviousResponse(payload, responseStates, { native = false
 function rememberResponse(responseStates, payload, response) {
   if (!response || typeof response !== "object" || typeof response.id !== "string" || !Array.isArray(response.output)) return;
   responseStates.set(response.id, {
-    items: [...inputItems(payload?.input), ...structuredClone(response.output)],
+    items: [
+      ...(payload?.previous_response_id ? responseStates.get(payload.previous_response_id)?.items || [] : []),
+      ...inputItems(payload?.input), ...structuredClone(response.output),
+    ],
   });
   while (responseStates.size > 1_000) responseStates.delete(responseStates.keys().next().value);
 }
 
-function modelCatalogRows(models) {
-  return models.map(model => ({
-    slug: routeId(model.id),
-    display_name: model.displayName,
-    description: `Official Antigravity CLI model: ${model.displayName}`,
-    supported_in_api: true,
-    supported_reasoning_levels: [{ effort: effortFromId(model.id), description: "Antigravity model effort" }],
-    default_reasoning_level: effortFromId(model.id),
-    visibility: "list",
-    input_modalities: ["text", "image"],
-    context_window: AGY_CONTEXT_WINDOW,
-    max_context_window: AGY_CONTEXT_WINDOW,
-    effective_context_window_percent: 100,
-    auto_compact_token_limit: AGY_AUTO_COMPACT_TOKEN_LIMIT,
-    use_responses_lite: false,
-  }));
-}
-
-function effortFromId(id) {
-  if (/(?:^|-)low$/.test(id)) return "low";
-  if (/(?:^|-)medium$/.test(id)) return "medium";
-  return "high";
-}
-
 function imagePreflightPrompt(prompt) {
-  const references = String(prompt).split(/\r?\n/)
-    .filter(line => /^\[Image (?:attachment|URL):/.test(line));
+  const references = [...new Set(String(prompt).split(/\r?\n/)
+    .filter(line => /^\[Image (?:attachment|URL):/.test(line)))];
   return [
     "MANDATORY IMAGE PREFLIGHT. Do not answer the user's request yet.",
     "First call view_file for every exact [Image attachment: ...] path below, and use the browser/image reading tool for every [Image URL: ...]. Inspect all visual attachments, wait for the tool results, then reply with a concise factual visual description prefixed IMAGE_CONTEXT:.",
@@ -179,44 +167,68 @@ function imagePreflightPrompt(prompt) {
   ].filter(Boolean).join("\n\n");
 }
 
-async function runAgyPrompt({ config, selected, payload, prompt, mode, effort, conversationId, signal, onEvent }) {
+async function runAgyPrompt({ config, workspace, selected, payload, prompt, signal, onEvent, inspectImages = true, hostTools, jsonSchema, completionInstruction, requestWorkspace = workspace.resolve(payload), conversationId }) {
+  const { cwd } = requestWorkspace;
   const attachmentDir = imageCacheDir();
-  const addDirs = existsSync(attachmentDir) ? [attachmentDir] : [];
-  let activeConversation = conversationId;
+  const addDirs = [];
+  const onSpawn = scope => {
+    workspace.lastRequest = { ...scope, ...requestWorkspace, cwd: scope.cwd, startedAt: new Date().toISOString(), model: selected.agy, effort: selected.effort, effortSource: selected.effortSource };
+    console.log(`AGY request scope: ${JSON.stringify(workspace.lastRequest)}`);
+  };
+  // A continuation is supplied only after matching the authoritative Codex input and workspace.
   let imageContext = "";
-  if (hasImageInput(payload)) {
-    const preflight = await runAgyTurn({
-      agyPath: config.agyPath,
-      cwd: config.cwd,
-      model: selected.agy,
-      prompt: imagePreflightPrompt(prompt),
-      mode,
-      effort,
-      conversationId: activeConversation,
-      addDirs,
-      timeoutMs: config.requestTimeoutSec * 1000,
-      signal,
-    });
-    activeConversation = preflight.conversation_id || activeConversation;
-    imageContext = `\n\nBridge image preflight context (the attachment was inspected by AGY):\n${String(preflight.response || "").trim()}`;
+  if (inspectImages && hasImageInput(payload)) {
+    const imagePrompt = imagePreflightPrompt(buildAgyPrompt({ input: currentVisualInput(payload) }));
+    workspace.imageContexts ||= new Map();
+    imageContext = workspace.imageContexts.get(imagePrompt) || "";
+    if (!imageContext) {
+      const preflight = await runAgyTurn({
+        agyPath: config.agyPath,
+        cwd: attachmentDir,
+        model: selected.agy,
+        prompt: imagePrompt,
+        mode: "default",
+        effort: selected.effort,
+        timeoutMs: config.requestTimeoutSec * 1000,
+        signal,
+        onSpawn,
+        onEvent,
+      });
+      imageContext = String(preflight.response || "").trim();
+      workspace.imageContexts.set(imagePrompt, imageContext);
+    }
   }
   const result = await runAgyTurn({
     agyPath: config.agyPath,
-    cwd: config.cwd,
+    cwd,
     model: selected.agy,
-    prompt: prompt + imageContext,
-    mode,
-    effort,
-    conversationId: activeConversation,
+    prompt: imageContext ? buildAgyPrompt(payload, { imageContext, hostTools }) : prompt,
+    // Codex supplies the collaboration mode and enforces all operations itself.
+    // AGY plan mode would prepend /plan and introduce a second approval workflow.
+    mode: "default",
+    effort: selected.effort,
+    conversationId,
     addDirs,
+    hostTools: true,
+    jsonSchema,
+    completionInstruction,
+    latestRequest: hostTools ? itemText(latestUserMessage(payload), false) : undefined,
     timeoutMs: config.requestTimeoutSec * 1000,
     signal,
-    onEvent,
+    onEvent: event => {
+      if (event.kind === "init") {
+        workspace.lastRequest.actualCwd = event.raw.init?.cwd;
+        workspace.lastRequest.permissionMode = event.raw.init?.permission_mode;
+        console.log(`AGY initialized scope: ${JSON.stringify(workspace.lastRequest)}`);
+      }
+      onEvent?.(event);
+    },
+    onSpawn,
   });
   return result;
 }
 
-function resolveModel(payload, models) {
+function resolveModel(payload, models, responseStates) {
   if (typeof payload.model !== "string" || !payload.model.trim()) throw new AgyError("model is required", "MODEL_REQUIRED");
   const requested = payload.model.trim();
   if (isLegacyBridgeModel(requested)) {
@@ -224,108 +236,161 @@ function resolveModel(payload, models) {
   }
   if (!isAntigravityModel(requested)) return { kind: "native", route: requested, native: requested };
   const id = agyModelId(requested);
-  if (!models.some(model => model.id === id)) {
+  const group = groupAgyModels(models).find(group => group.id === id || group.variants.some(variant => variant.id === id));
+  if (!group) {
     throw new AgyError(`Unknown Antigravity model: ${requested}`, "MODEL_NOT_FOUND");
   }
-  return { kind: "antigravity", route: routeId(id), agy: id };
+  // Native Codex keeps its base effort and appends durable slider updates to input.
+  // The latest update, including one carried by previous_response_id, takes precedence.
+  const inputs = [
+    ...(payload.previous_response_id ? responseStates.get(payload.previous_response_id)?.items || [] : []),
+    ...inputItems(payload.input),
+  ];
+  const configuredEffort = inputs.findLast(item => item?.type === "configuration_update"
+    && item.reasoning?.effort !== undefined)?.reasoning.effort;
+  const effort = configuredEffort ?? payload.reasoning?.effort ?? group.variants.find(variant => variant.id === id)?.effort ?? group.defaultEffort;
+  const variant = group.variants.find(variant => variant.effort === effort);
+  if (!variant) {
+    throw new AgyError(`Unsupported reasoning effort '${effort}' for ${requested}; available: ${group.variants.map(variant => variant.effort).join(", ")}`, "UNSUPPORTED_REASONING_EFFORT");
+  }
+  return { kind: "antigravity", route: routeId(id), agy: variant.id, effort,
+    effortSource: configuredEffort != null ? "configuration_update" : payload.reasoning?.effort != null ? "request" : "model_default" };
 }
 
-async function runAgyResponse({ config, models, payload, conversations, responseStates, signal, emit }) {
+async function runAgyResponse({ config, workspace, selected, payload, conversations, responseStates, announcedTurns, signal, emit }) {
   const effectivePayload = expandPreviousResponse(payload, responseStates, { conversations });
-  const selected = resolveModel(effectivePayload, models);
-  if (selected.kind !== "antigravity") throw new AgyError("The request is not an Antigravity model", "MODEL_PROVIDER");
-  const prompt = buildAgyPrompt(effectivePayload);
+  const tools = codexTools([
+    ...(payload.tools || []),
+    ...inputItems(effectivePayload.input).flatMap(item => item.type === "tool_search_output" ? item.tools || [] : []),
+  ]);
+  const requestWorkspace = workspace.resolve(effectivePayload);
+  const turnId = payload.client_metadata?.turn_id;
+  const threadId = payload.client_metadata?.thread_id;
+  const inputs = inputItems(effectivePayload.input);
+  const inputKeys = inputs.map(item => createHash("sha256").update(JSON.stringify([
+    item.type || "message", item.role || "", item.call_id || "", item.name || "", item.namespace || "", itemText(item, false),
+  ])).digest("hex"));
+  const scope = createHash("sha256").update(JSON.stringify([
+    config.agyPath, selected.agy, selected.effort, requestWorkspace, effectivePayload.instructions, tools,
+  ])).digest("hex");
+  workspace.agyContinuations ||= new Map();
+  const previous = threadId && workspace.agyContinuations.get(threadId);
+  const added = previous ? inputs.slice(previous.inputKeys.length) : [];
+  const canResume = previous && turnId && previous.turnId === turnId && previous.scope === scope
+    && inputKeys.length > previous.inputKeys.length
+    && previous.inputKeys.every((key, index) => inputKeys[index] === key)
+    && previous.pendingCalls.every(id => added.some(item => item.call_id === id
+      && ["function_call_output", "custom_tool_call_output", "tool_search_output"].includes(item.type)));
+  // Failed/cancelled requests must not leave a resumable branch behind.
+  if (threadId) workspace.agyContinuations.delete(threadId);
+  const current = latestUserMessage(effectivePayload);
+  const promptPayload = canResume ? { ...effectivePayload, input: [
+    ...(current !== undefined && !added.includes(current) ? [current] : []), ...added,
+  ] } : effectivePayload;
+  const prompt = buildAgyPrompt(promptPayload, { hostTools: tools });
   if (!prompt) throw new AgyError("input is required", "INPUT_REQUIRED");
+  console.log(JSON.stringify({ time: new Date().toISOString(), event: "agy_context_mode", thread_id: threadId,
+    mode: canResume ? "resume" : "fresh", input_items: inputs.length,
+    added_items: canResume ? added.length : inputs.length, prompt_bytes: Buffer.byteLength(prompt),
+    model: selected.agy, effort: selected.effort, effort_source: selected.effortSource,
+    request_effort: payload.reasoning?.effort ?? null }));
 
   const responseId = `resp_${randomUUID().replaceAll("-", "")}`;
   const sequence = { value: 0 };
-  const previous = typeof effectivePayload.previous_response_id === "string"
-    ? conversations.get(effectivePayload.previous_response_id)
-    : undefined;
   const initial = responseBody({ id: responseId, model: selected.route, text: "", status: "in_progress" });
-  const itemId = initial.output[0].id;
+  initial.output = [];
   emit("response.created", { response: initial }, sequence);
-  emit("response.output_item.added", { output_index: 0, item: initial.output[0] }, sequence);
-  emit("response.content_part.added", {
-    item_id: itemId,
-    output_index: 0,
-    content_index: 0,
-    part: { type: "output_text", text: "", annotations: [] },
-  }, sequence);
 
-  let sentDelta = false;
+  const output = [];
+  const emitMessage = (text, phase) => {
+    const item = { id: `msg_${randomUUID().replaceAll("-", "")}`, type: "message", role: "assistant", phase, status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
+    const output_index = output.length;
+    output.push(item);
+    emit("response.output_item.added", { output_index, item: { ...item, status: "in_progress", content: [] } }, sequence);
+    emit("response.content_part.added", { item_id: item.id, output_index, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }, sequence);
+    emit("response.output_text.delta", { item_id: item.id, output_index, content_index: 0, delta: text }, sequence);
+    emit("response.output_text.done", { item_id: item.id, output_index, content_index: 0, text }, sequence);
+    emit("response.content_part.done", { item_id: item.id, output_index, content_index: 0, part: item.content[0] }, sequence);
+    emit("response.output_item.done", { output_index, item }, sequence);
+  };
+  if (!turnId || announcedTurns.get(threadId) !== turnId) {
+    emitMessage("我收到這次的要求了，會依這則訊息處理，並在過程中回報進度。", "commentary");
+    if (turnId) announcedTurns.set(threadId, turnId);
+  }
+  const startedAt = Date.now();
+  let lastUpdate = startedAt;
+  let usingTools = false;
+  let contextProgress;
+  const progressTimer = setInterval(() => {
+    if (Date.now() - lastUpdate < 60_000) return;
+    emitMessage(contextProgress && contextProgress.loaded < contextProgress.total
+      ? `正在載入對話資料（已完成 ${contextProgress.loaded}/${contextProgress.total} 段）；載入完成後才會繼續判斷下一步。`
+      : usingTools
+      ? "目前仍在處理本回合所需的操作，還沒有新的結果；完成這個階段後會回報。"
+      : `模型仍在處理這則訊息，目前尚未回傳答案（已等待 ${Math.floor((Date.now() - startedAt) / 1000)} 秒）。`, "commentary");
+    lastUpdate = Date.now();
+  }, 60_000);
   const result = await runAgyPrompt({
     config,
+    workspace,
     selected,
-    payload: effectivePayload,
+    payload: promptPayload,
     prompt,
-    mode: config.mode,
-    effort: effectivePayload.reasoning?.effort,
-    conversationId: previous,
+    requestWorkspace,
+    conversationId: canResume ? previous.conversationId : undefined,
+    hostTools: tools,
+    jsonSchema: HOST_RESPONSE_SCHEMA,
     signal,
     onEvent: event => {
-      const delta = event.kind === "step" && typeof event.step.text_delta === "string"
-        ? event.step.text_delta
-        : "";
-      if (!delta) return;
-      sentDelta = true;
-      emit("response.output_text.delta", {
-        item_id: itemId,
-        output_index: 0,
-        content_index: 0,
-        delta,
-      }, sequence);
+      if (event.kind === "context") contextProgress = event;
+      if (event.kind !== "step") return;
+      const step = event.step;
+      if (step.step_type === "tool") usingTools = !["DONE", "ERROR"].includes(step.state);
+      else if (step.step_type === "agent_response") usingTools = false;
     },
-  });
+  }).finally(() => clearInterval(progressTimer));
   if (result.conversation_id) conversations.set(responseId, result.conversation_id);
-  const finalText = result.response || "";
-  if (!sentDelta && finalText) {
-    emit("response.output_text.delta", {
-      item_id: itemId,
-      output_index: 0,
-      content_index: 0,
-      delta: finalText,
-    }, sequence);
+  const answer = parseHostResponse(result, tools);
+  const finalText = answer.calls.length ? "" : answer.message;
+  if (answer.message) emitMessage(answer.message, answer.calls.length ? "commentary" : "final_answer");
+  for (const item of answer.calls) {
+    const output_index = output.length;
+    output.push(item);
+    const argumentField = item.type === "custom_tool_call" ? "input" : "arguments";
+    emit("response.output_item.added", { output_index, item: { ...item, status: "in_progress" } }, sequence);
+    if (item.type !== "tool_search_call") {
+      emit(item.type === "custom_tool_call" ? "response.custom_tool_call_input.done" : "response.function_call_arguments.done", { item_id: item.id, output_index, [argumentField]: item[argumentField] }, sequence);
+    }
+    emit("response.output_item.done", { output_index, item }, sequence);
   }
-  emit("response.output_text.done", {
-    item_id: itemId,
-    output_index: 0,
-    content_index: 0,
-    text: finalText,
-  }, sequence);
-  emit("response.content_part.done", {
-    item_id: itemId,
-    output_index: 0,
-    content_index: 0,
-    part: { type: "output_text", text: finalText, annotations: [] },
-  }, sequence);
   const completed = responseBody({ id: responseId, model: selected.route, text: finalText, result });
-  completed.output[0].id = itemId;
-  emit("response.output_item.done", { output_index: 0, item: completed.output[0] }, sequence);
+  completed.output = output;
   emit("response.completed", { response: completed }, sequence);
   rememberResponse(responseStates, effectivePayload, completed);
+  if (threadId && turnId && result.conversation_id && answer.calls.length) {
+    workspace.agyContinuations.set(threadId, {
+      turnId, scope, inputKeys, conversationId: result.conversation_id,
+      pendingCalls: answer.calls.map(call => call.call_id),
+    });
+    while (workspace.agyContinuations.size > 1_000) workspace.agyContinuations.delete(workspace.agyContinuations.keys().next().value);
+  }
   return { responseId, response: completed, result };
 }
 
-async function runAgyCompaction({ config, models, payload, conversations, responseStates, signal }) {
+async function runAgyCompaction({ config, workspace, selected, payload, conversations, responseStates, signal }) {
   const effectivePayload = expandPreviousResponse(payload, responseStates, { conversations });
-  const selected = resolveModel(effectivePayload, models);
-  if (selected.kind !== "antigravity") throw new AgyError("The request is not an Antigravity model", "MODEL_PROVIDER");
-  const previous = typeof effectivePayload.previous_response_id === "string"
-    ? conversations.get(effectivePayload.previous_response_id)
-    : undefined;
-  const source = buildAgyPrompt(effectivePayload)
-    || (previous ? "Use the preceding conversation in this AGY session as the source context." : "");
+  const source = buildAgyPrompt(effectivePayload);
   if (!source) throw new AgyError("input is required for compaction", "INPUT_REQUIRED");
-  const prompt = `${source}\n\nSummarize the preceding coding conversation for a later continuation. Preserve the user's goals, relevant decisions, file paths, commands, errors, and unfinished work. Be concise and do not invent facts.`;
+  const compactionTask = "Summarize the preceding coding conversation for a later continuation. Preserve the user's goals, relevant decisions, file paths, commands, errors, and unfinished work. Be concise and do not invent facts.";
+  const prompt = `${source}\n\n${compactionTask}`;
   const result = await runAgyPrompt({
     config,
+    workspace,
     selected,
     payload: effectivePayload,
     prompt,
-    mode: "plan",
-    effort: effectivePayload.reasoning?.effort,
-    conversationId: previous,
+    completionInstruction: compactionTask,
+    inspectImages: false,
     signal,
   });
   const responseId = `resp_${randomUUID().replaceAll("-", "")}`;
@@ -407,7 +472,8 @@ function attachWebSocket(socket, onMessage, onClose) {
     payload.writeUInt16BE(code, 0);
     reasonBytes.copy(payload, 2);
     writeWebSocketFrame(socket, 0x8, payload);
-    socket.end();
+    socket.destroySoon();
+    onClose?.();
   };
 
   const parse = () => {
@@ -457,7 +523,7 @@ function attachWebSocket(socket, onMessage, onClose) {
         if (opcode === 0x8) {
           if (!closed) writeWebSocketFrame(socket, 0x8, payload);
           closed = true;
-          socket.end();
+          socket.destroySoon();
           onClose?.();
           return;
         }
@@ -502,6 +568,7 @@ function attachWebSocket(socket, onMessage, onClose) {
       onClose?.();
     }
   });
+  socket.on("end", () => close());
   socket.on("error", () => {
     if (!closed) {
       closed = true;
@@ -565,7 +632,7 @@ function openNativeWebSocket(config, req, peer, onEvent, onClose) {
         else if (value && typeof value.text === "function") value = await value.text();
       }
       if (typeof value === "string") {
-        try { onEvent?.(JSON.parse(value)); } catch { /* preserve non-JSON upstream frames */ }
+        try { if (onEvent?.(JSON.parse(value)) === false) return; } catch { /* preserve non-JSON upstream frames */ }
         if (!peer.isClosed) peer.sendText(value);
       }
     });
@@ -580,7 +647,15 @@ function openNativeWebSocket(config, req, peer, onEvent, onClose) {
   });
 }
 
-function acceptWebSocket(config, models, conversations, responseStates, req, socket, head) {
+function acceptWebSocket(config, workspace, models, conversations, responseStates, announcedTurns, lifecycle, req, socket, head) {
+  if (!isLocalRequest(req)) {
+    socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  if (lifecycle.draining) {
+    socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+    return;
+  }
   const url = new URL(req.url || "/", `http://${config.host}:${config.port}`);
   if (url.pathname !== "/v1/responses") {
     socket.destroy();
@@ -600,6 +675,7 @@ function acceptWebSocket(config, models, conversations, responseStates, req, soc
   ].join("\r\n"));
 
   let nativeSocket;
+  let nativeWork;
   let localAbort;
   let closed = false;
   let messages = Promise.resolve();
@@ -630,47 +706,116 @@ function acceptWebSocket(config, models, conversations, responseStates, req, soc
       }
       return;
     }
+    if (lifecycle.draining) {
+      peer.sendJson({ type: "error", error: { code: "BRIDGE_DRAINING", message: "Bridge 正在完成既有請求後重新啟動，請稍後重試。" } });
+      return;
+    }
     messages = messages.then(async () => {
       const requestBody = websocketRequestBody(payload);
       const model = websocketModel(requestBody);
       try {
-        const selected = resolveModel(requestBody, models);
+        const selected = resolveModel(requestBody, models, responseStates);
         if (selected.kind === "native") {
-          const nativePayload = scrubBridgeArtifactsForNative(
-            expandPreviousResponse(requestBody, responseStates, { native: true, conversations }),
-          );
-          if (!nativeSocket || nativeSocket.readyState !== WebSocket.OPEN) {
-            let openedSocket;
-            openedSocket = await openNativeWebSocket(config, req, peer, rememberNativeEvent, () => {
-              if (nativeSocket === openedSocket) nativeSocket = undefined;
-            });
-            nativeSocket = openedSocket;
-          }
-          if (!peer.isClosed && nativeSocket.readyState === WebSocket.OPEN) {
-            nativePayloadQueue.push(nativePayload);
-            try {
-              const outbound = payload?.type === "response.create"
-                ? { ...nativePayload, type: "response.create" }
-                : nativePayload;
-              nativeSocket.send(JSON.stringify(outbound));
-            } catch (error) {
-              nativePayloadQueue.pop();
-              throw error;
+          const done = requestBody.generate === false ? () => {} : lifecycle.beginModel(socket);
+          try {
+            const nativePayload = scrubBridgeArtifactsForNative(
+              expandPreviousResponse(requestBody, responseStates, { native: true, conversations }),
+            );
+            // Native continuation IDs belong to the upstream socket. Let Codex replay
+            // its own complete history after reconnecting, including completed tools.
+            if (nativePayload.previous_response_id && nativeSocket?.readyState !== WebSocket.OPEN) {
+              console.warn(JSON.stringify({ time: new Date().toISOString(), event: "native_response_replay_required", pid: process.pid, reason: "upstream_connection_closed" }));
+              peer.close(1012, "Native session closed; reconnect with full history");
+              done();
+              return;
             }
+            // A full history replay after a model switch needs a fresh upstream session.
+            if (!nativePayload.previous_response_id && nativeSocket) {
+              nativeSocket.close();
+              nativeSocket = undefined;
+              nativePayloadQueue.length = 0;
+              nativePayloads.clear();
+            }
+            if (!nativeSocket || nativeSocket.readyState !== WebSocket.OPEN) {
+              let openedSocket;
+              const work = { queue: [], ids: new Map(), pending: new Set() };
+              openedSocket = await openNativeWebSocket(config, req, peer, event => {
+                lifecycle.lastProgressAt = Date.now();
+                const id = event?.response?.id;
+                if (event?.type === "response.created") work.ids.set(id, work.queue.shift());
+                if (["response.completed", "response.failed", "response.incomplete"].includes(event?.type)) {
+                  const done = work.ids.get(id) || work.queue.shift();
+                  work.ids.delete(id);
+                  if (done) { work.pending.delete(done); done(); }
+                }
+                if (event?.type === "error") {
+                  for (const done of work.pending) done();
+                  work.pending.clear(); work.queue.length = 0; work.ids.clear();
+                  if (event.status === 400 && event.error?.message === "Invalid `previous_response_id`.") {
+                    console.warn(JSON.stringify({ time: new Date().toISOString(), event: "native_response_replay_required", pid: process.pid, reason: "invalid_previous_response_id" }));
+                    peer.close(1012, "Native response expired; reconnect with full history");
+                    return false;
+                  }
+                }
+                rememberNativeEvent(event);
+              }, event => {
+                for (const done of work.pending) done();
+                work.pending.clear();
+                if (nativeSocket === openedSocket) {
+                  nativeSocket = undefined;
+                  console.warn(JSON.stringify({ time: new Date().toISOString(), event: "native_upstream_closed", pid: process.pid, close_code: event?.code ?? null }));
+                }
+              });
+              nativeSocket = openedSocket;
+              nativeWork = work;
+            }
+            if (!peer.isClosed && nativeSocket.readyState === WebSocket.OPEN) {
+              nativeWork.queue.push(done);
+              nativeWork.pending.add(done);
+              nativePayloadQueue.push(nativePayload);
+              try {
+                const outbound = payload?.type === "response.create"
+                  ? { ...nativePayload, type: "response.create" }
+                  : nativePayload;
+                nativeSocket.send(JSON.stringify(outbound));
+              } catch (error) {
+                nativeWork.queue.pop();
+                nativeWork.pending.delete(done);
+                nativePayloadQueue.pop();
+                throw error;
+              }
+            } else done();
+          } catch (error) {
+            done();
+            throw error;
           }
           return;
         }
 
+        if (requestBody.generate === false) {
+          const response = responseBody({ id: `resp_agy_warmup_${randomUUID().replaceAll("-", "")}`, model: selected.route, text: "" });
+          response.output = [];
+          response.usage = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+          rememberResponse(responseStates, requestBody, response);
+          const sequence = { value: 0 };
+          peer.sendJson(responseEvent("response.created", sequence, { response: { ...response, status: "in_progress" } }));
+          peer.sendJson(responseEvent("response.completed", sequence, { response }));
+          return;
+        }
+
         const abort = new AbortController();
+        const done = lifecycle.beginModel(socket);
         localAbort = abort;
         const sequenceEmitter = (event, data, sequence) => {
+          lifecycle.lastProgressAt = Date.now();
           if (!peer.isClosed) peer.sendJson(responseEvent(event, sequence, data));
         };
         try {
           if (isCompactionPayload(requestBody)) {
             const compacted = await runAgyCompaction({
               config,
-              models,
+              workspace,
+              selected,
               payload: requestBody,
               conversations,
               responseStates,
@@ -680,10 +825,12 @@ function acceptWebSocket(config, models, conversations, responseStates, req, soc
           } else {
             await runAgyResponse({
               config,
-              models,
+              workspace,
+              selected,
               payload: requestBody,
               conversations,
               responseStates,
+              announcedTurns,
               signal: abort.signal,
               emit: sequenceEmitter,
             });
@@ -693,9 +840,11 @@ function acceptWebSocket(config, models, conversations, responseStates, req, soc
           if (!peer.isClosed) {
             const sequence = { value: 0 };
             const failed = responseBody({ id: `resp_${randomUUID().replaceAll("-", "")}`, model: model || "antigravity", text: "", status: "failed" });
-            peer.sendJson(responseEvent("response.failed", sequence, { response: failed, error: { type: "server_error", message } }));
+            failed.error = { type: "server_error", message, ...(error.code ? { code: error.code } : {}) };
+            peer.sendJson(responseEvent("response.failed", sequence, { response: failed, error: failed.error }));
           }
         } finally {
+          done();
           if (localAbort === abort) localAbort = undefined;
         }
       } catch (error) {
@@ -714,6 +863,7 @@ function acceptWebSocket(config, models, conversations, responseStates, req, soc
     nativePayloads.clear();
     if (nativeSocket && nativeSocket.readyState < WebSocket.CLOSING) nativeSocket.close();
   });
+  lifecycle.trackWebSocket(socket, () => queueMicrotask(() => peer.close(1001, "Bridge restarting after drain")));
   peer.feed(head);
 }
 
@@ -738,6 +888,7 @@ async function proxyNative(config, req, res, endpoint, body, responseStates) {
     if (endpoint === "responses" && body && typeof body === "object") {
       const eventStream = (upstream.headers.get("content-type") || "").toLowerCase().includes("text/event-stream");
       if (eventStream) {
+        res.bridgeMarkStream?.();
         await pipeNativeResponse(res, upstream, event => {
           if (event?.type === "response.completed" && event.response) rememberResponse(responseStates, body, event.response);
         });
@@ -766,7 +917,13 @@ async function proxyNative(config, req, res, endpoint, body, responseStates) {
 async function proxyNativeModels(config, req, res, models) {
   const request = requestAbortSignal(req, res);
   try {
-    const upstream = await fetchNative({ config, req, endpoint: "models", signal: request.signal });
+    const [nativeResult, modelResult, usageResult] = await Promise.allSettled([
+      fetchNative({ config, req, endpoint: "models", signal: request.signal }),
+      discoverAgyModels(config.agyPath, config.cwd),
+      getAgyUsage(config.agyPath, false, config.cwd),
+    ]);
+    if (nativeResult.status === "rejected") throw nativeResult.reason;
+    const upstream = nativeResult.value;
     if (!upstream.ok || !upstream.body) {
       await pipeNativeResponse(res, upstream);
       return;
@@ -783,11 +940,11 @@ async function proxyNativeModels(config, req, res, models) {
     if (!catalog || typeof catalog !== "object" || Array.isArray(catalog) || !Array.isArray(catalog.models)) {
       throw new AgyError("Native model catalog did not contain a models array", "NATIVE_CATALOG");
     }
-    const nativeModels = catalog.models.filter(model => {
-      const slug = model && typeof model === "object" && typeof model.slug === "string" ? model.slug : "";
-      return !isAntigravityModel(slug) && !isLegacyBridgeModel(slug);
-    });
-    json(res, upstream.status, { ...catalog, models: [...nativeModels, ...modelCatalogRows(models)] });
+    if (modelResult.status === "fulfilled") models.splice(0, models.length, ...modelResult.value);
+    else console.error(`Antigravity model refresh failed; keeping the last catalog: ${modelResult.reason.message}`);
+    const usage = usageResult.status === "fulfilled" ? usageResult.value : undefined;
+    if (!usage) console.error(`Quota refresh failed: ${usageResult.reason.message}`);
+    json(res, upstream.status, buildCodexCatalog(models, catalog, usage));
   } catch (error) {
     if (request.signal.aborted) throw new AgyError("Request was cancelled", "ABORT_ERR");
     if (error instanceof AgyError) throw error;
@@ -802,26 +959,61 @@ async function proxyNativeModels(config, req, res, models) {
 }
 
 export function createBridgeServer(config, models) {
+  const lifecycle = new BridgeLifecycle();
+  let workspace;
+  try {
+    workspace = createWorkspacePolicy(config);
+  } catch (error) {
+    // An invalid AGY workspace disables AGY only; native routing must remain available.
+    workspace = { roots: config.allowedWorkspaceRoots || [], lastRequest: null, error, resolve() { throw error; } };
+  }
   const conversations = new Map();
   const responseStates = new Map();
+  const announcedTurns = new Map();
   const server = createServer(async (req, res) => {
+    if (!isLocalRequest(req)) {
+      json(res, 403, errorPayload("The bridge accepts requests from the local Codex client and its local dashboard.", "forbidden"));
+      return;
+    }
     if (req.method === "OPTIONS") {
-      res.writeHead(204, {
-        "access-control-allow-origin": "*",
-        "access-control-allow-methods": "GET,POST,OPTIONS",
-        "access-control-allow-headers": "content-type,authorization",
-      });
-      res.end();
+      res.writeHead(204).end();
       return;
     }
     const url = new URL(req.url || "/", `http://${config.host}:${config.port}`);
+    if (url.pathname !== "/healthz") {
+      if (lifecycle.draining) {
+        json(res, 503, errorPayload("Bridge 正在排空既有請求，請稍後重試。", "server_error", "BRIDGE_DRAINING"));
+        return;
+      }
+      lifecycle.trackHttp(req, res, req.method === "POST" && url.pathname.startsWith("/v1/responses"));
+    }
     try {
+      if (req.method === "GET" && ["/usage", "/usage/"].includes(url.pathname)) {
+        const page = readFileSync(new URL("./usage.html", import.meta.url));
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+        res.end(page);
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/v1/usage") {
+        try { json(res, 200, await getAgyUsage(config.agyPath, url.searchParams.get("refresh") === "true", config.cwd)); }
+        catch { json(res, 503, { error: "暫時無法取得 Antigravity 額度，請重新整理。" }); }
+        return;
+      }
       if (req.method === "GET" && url.pathname === "/healthz") {
         json(res, 200, {
           ok: true,
+          pid: process.pid,
+          lifecycle: lifecycle.snapshot(),
           service: "codex-bridge-antigravity",
           agy_path: config.agyPath,
           cwd: config.cwd,
+          allowed_workspace_roots: workspace.roots,
+          workspace_policy: "codex-thread-with-configured-fallback",
+          agy_workspace_ok: !workspace.error,
+          ...(workspace.error ? { agy_workspace_error: workspace.error.message } : {}),
+          skip_permissions: false,
+          tool_executor: "codex",
+          last_agy_request: workspace.lastRequest,
           model_count: models.length,
           native_base_url: config.nativeBaseUrl,
           websocket: true,
@@ -843,7 +1035,8 @@ export function createBridgeServer(config, models) {
       }
 
       const payload = await readJson(req);
-      const selected = resolveModel(payload, models);
+      if (payload.stream === true) res.bridgeMarkStream?.();
+      const selected = resolveModel(payload, models, responseStates);
       if (selected.kind === "native") {
         const nativePayload = scrubBridgeArtifactsForNative(
           expandPreviousResponse(payload, responseStates, { native: true, conversations }),
@@ -856,7 +1049,8 @@ export function createBridgeServer(config, models) {
         try {
           const compacted = await runAgyCompaction({
             config,
-            models,
+            workspace,
+            selected,
             payload,
             conversations,
             responseStates,
@@ -881,12 +1075,12 @@ export function createBridgeServer(config, models) {
             "content-type": "text/event-stream; charset=utf-8",
             "cache-control": "no-cache, no-transform",
             connection: "keep-alive",
-            "access-control-allow-origin": "*",
           });
           try {
             const compacted = await runAgyCompaction({
               config,
-              models,
+              workspace,
+              selected,
               payload,
               conversations,
               responseStates,
@@ -898,14 +1092,16 @@ export function createBridgeServer(config, models) {
             const message = error instanceof Error ? error.message : String(error);
             const failedSequence = { value: 0 };
             const failed = responseBody({ id: `resp_${randomUUID().replaceAll("-", "")}`, model: selected.route, text: "", status: "failed" });
-            sse(res, "response.failed", failedSequence, { response: failed, error: { type: "server_error", message } });
+            failed.error = { type: "server_error", message, ...(error.code ? { code: error.code } : {}) };
+            sse(res, "response.failed", failedSequence, { response: failed, error: failed.error });
             if (!res.writableEnded) res.end("data: [DONE]\n\n");
           }
           return;
         }
         const compacted = await runAgyCompaction({
           config,
-          models,
+          workspace,
+          selected,
           payload,
           conversations,
           responseStates,
@@ -919,15 +1115,16 @@ export function createBridgeServer(config, models) {
           "content-type": "text/event-stream; charset=utf-8",
           "cache-control": "no-cache, no-transform",
           connection: "keep-alive",
-          "access-control-allow-origin": "*",
         });
         try {
           await runAgyResponse({
             config,
-            models,
+            workspace,
+            selected,
             payload,
             conversations,
             responseStates,
+            announcedTurns,
             signal: abort.signal,
             emit: (event, data, sequence) => sse(res, event, sequence, data),
           });
@@ -936,7 +1133,8 @@ export function createBridgeServer(config, models) {
           const message = error instanceof Error ? error.message : String(error);
           const failedSequence = { value: 0 };
           const failed = responseBody({ id: `resp_${randomUUID().replaceAll("-", "")}`, model: selected.route, text: "", status: "failed" });
-          sse(res, "response.failed", failedSequence, { response: failed, error: { type: "server_error", message } });
+          failed.error = { type: "server_error", message, ...(error.code ? { code: error.code } : {}) };
+          sse(res, "response.failed", failedSequence, { response: failed, error: failed.error });
           if (!res.writableEnded) res.end("data: [DONE]\n\n");
         }
         return;
@@ -944,10 +1142,12 @@ export function createBridgeServer(config, models) {
 
       const result = await runAgyResponse({
         config,
-        models,
+        workspace,
+        selected,
         payload,
         conversations,
         responseStates,
+        announcedTurns,
         signal: abort.signal,
         emit: () => {},
       });
@@ -959,13 +1159,19 @@ export function createBridgeServer(config, models) {
           : error?.code === "ABORT_ERR" ? 499
             : error?.code === "NATIVE_AUTH" ? 401
               : error?.code === "NATIVE_UPSTREAM" || error?.code === "NATIVE_CATALOG"
-                || error?.code === "AGY_RESULT" || error?.code === "AGY_EXIT" || error?.code === "AGY_COMPACT" ? 502
+                || ["AGY_RESULT", "AGY_EXIT", "AGY_COMPACT", "AGY_START", "AGY_PROCESS", "AGY_STDIN", "AGY_TIMEOUT"].includes(error?.code) ? 502
                 : 400;
       if (!res.headersSent) json(res, status, errorPayload(error instanceof Error ? error.message : String(error), error?.code === "AGY_PROCESS" ? "server_error" : "invalid_request_error", error?.code));
       else if (!res.writableEnded) res.end();
     }
   });
-  server.on("upgrade", (req, socket, head) => acceptWebSocket(config, models, conversations, responseStates, req, socket, head));
+  server.bridgeLifecycle = lifecycle;
+  server.shutdown = timeoutMs => lifecycle.shutdown(server, timeoutMs);
+  server.on("connection", socket => {
+    lifecycle.sockets.add(socket);
+    socket.once("close", () => lifecycle.sockets.delete(socket));
+  });
+  server.on("upgrade", (req, socket, head) => acceptWebSocket(config, workspace, models, conversations, responseStates, announcedTurns, lifecycle, req, socket, head));
   return server;
 }
 

@@ -6,3 +6,6 @@ graphify-out/
 .env.*
 coverage/
 *.local
+backups/
+outputs/
+bin/

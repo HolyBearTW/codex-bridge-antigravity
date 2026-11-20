@@ -15,15 +15,13 @@ export function isLegacyBridgeModel(value) {
   return typeof value === "string" && (value.startsWith("freebuff/") || value.startsWith("gemini-web/"));
 }
 
-export const FALLBACK_AGY_MODELS = [
-  ["gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"],
-  ["gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"],
-  ["gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"],
-].map(([id, displayName]) => ({ id, displayName }));
-
-function runAgyModels(agyPath, timeoutMs = 30_000) {
+function runAgyModels(agyPath, cwd, timeoutMs = 30_000) {
   return new Promise((resolve, reject) => {
-    const child = spawn(agyPath, ["models"], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(agyPath, ["models"], {
+      cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+      // AGY's detached updater launches its own visible console on Windows.
+      env: { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: "true" },
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -81,20 +79,12 @@ function dedupeModels(models) {
 export function isAllowedAgyModel(modelOrId) {
   const rawId = typeof modelOrId === "string" ? modelOrId : modelOrId?.id;
   if (typeof rawId !== "string") return false;
-  const id = agyModelId(rawId);
-  const match = id.match(/^gemini-(\d+)(?:\.(\d+))?-flash(?:-(high|medium|low))?$/i);
-  if (!match) return false;
-  const major = parseInt(match[1], 10);
-  const minor = match[2] ? parseInt(match[2], 10) : 0;
-  if (major > 3) return true;
-  if (major === 3 && minor >= 8) return true;
-  return false;
+  return /^(?:gemini|claude)-/.test(agyModelId(rawId));
 }
 
-export async function discoverAgyModels(agyPath) {
-  const parsed = parseAgyModels(await runAgyModels(agyPath));
-  const available = parsed.length > 0 ? parsed : FALLBACK_AGY_MODELS;
-  return available.filter(isAllowedAgyModel);
+export async function discoverAgyModels(agyPath, cwd) {
+  const parsed = parseAgyModels(await runAgyModels(agyPath, cwd));
+  return parsed.filter(isAllowedAgyModel);
 }
 
 export function routeId(modelId) {
@@ -105,10 +95,30 @@ export function agyModelId(route) {
   return route.startsWith(MODEL_PREFIX) ? route.slice(MODEL_PREFIX.length) : route;
 }
 
-function effortForModel(id) {
-  if (/(?:^|-)low$/.test(id)) return "low";
-  if (/(?:^|-)medium$/.test(id)) return "medium";
-  return "high";
+export function groupAgyModels(models) {
+  const groups = new Map();
+  const efforts = ["low", "medium", "high", "xhigh", "max"];
+  for (const model of models) {
+    const suffix = model.id.match(/-(low|medium|high|xhigh|max)$/);
+    const id = suffix ? model.id.slice(0, -suffix[0].length) : model.id;
+    if (!groups.has(id)) {
+      groups.set(id, {
+        id,
+        displayName: model.displayName.replace(/\s*\((Low|Medium|High|XHigh|Max)\)$/i, ""),
+        variants: [],
+      });
+    }
+    groups.get(id).variants.push({ id: model.id, effort: suffix?.[1] || "high" });
+  }
+  return [...groups.values()].map(group => {
+    const variants = group.variants.toSorted((a, b) => efforts.indexOf(a.effort) - efforts.indexOf(b.effort));
+    return {
+      ...group,
+      variants,
+      defaultEffort: (variants.find(variant => variant.effort === "medium")
+        || variants.find(variant => variant.effort === "high") || variants[0]).effort,
+    };
+  });
 }
 
 function nativeCatalog() {
@@ -158,13 +168,16 @@ function reasoningLevel(template, effort) {
   };
 }
 
-function buildModel(template, model) {
-  const effort = effortForModel(model.id);
+function buildModel(template, model, usage) {
   const base = template && typeof template === "object" ? structuredClone(template) : {};
+  // Google publishes 1,048,576 for these Gemini families; Claude 5.5 publishes 1M.
+  // Keep future/unknown models at the existing fallback until their limits are confirmed.
+  const contextWindow = /^gemini-(?:4-(?:argon|hydrogen)|3\.8-flash)(?:-|$)/.test(model.id)
+    ? 1_048_576 : AGY_CONTEXT_WINDOW;
   const result = {
     ...base,
     slug: routeId(model.id),
-    display_name: model.displayName,
+    display_name: model.displayName.startsWith("Orchestrator") ? "Gemini Argon Orch" : model.displayName,
     description: `Official Antigravity CLI model: ${model.displayName}`,
     visibility: "list",
     supported_in_api: true,
@@ -172,12 +185,12 @@ function buildModel(template, model) {
     tool_mode: null,
     multi_agent_version: "disabled",
     upgrade: null,
-    default_reasoning_level: effort,
-    supported_reasoning_levels: [reasoningLevel(template, effort)],
-    context_window: AGY_CONTEXT_WINDOW,
-    max_context_window: AGY_CONTEXT_WINDOW,
+    default_reasoning_level: model.defaultEffort,
+    supported_reasoning_levels: model.variants.map(variant => reasoningLevel(template, variant.effort)),
+    context_window: contextWindow,
+    max_context_window: contextWindow,
     effective_context_window_percent: 100,
-    auto_compact_token_limit: AGY_AUTO_COMPACT_TOKEN_LIMIT,
+    auto_compact_token_limit: Math.floor(contextWindow * .8),
     use_responses_lite: false,
     additional_speed_tiers: [],
     service_tiers: [],
@@ -185,20 +198,45 @@ function buildModel(template, model) {
   };
   delete result.comp_hash;
   delete result.availability_nux;
+  const family = model.id.startsWith("claude-") ? "claude" : "gemini";
+  let group = usage?.groups.find(group => group.buckets.some(bucket => bucket.id === (family === "claude" ? "3p-weekly" : "gemini-weekly")));
+  if (family === "gemini" && /argon/i.test(model.id + model.displayName)) {
+    group = usage?.groups.find(group => group.buckets.some(bucket => bucket.id.includes("argon"))) || group;
+  }
+  if (group) {
+    const percentage = new Intl.NumberFormat("zh-TW", { style: "percent", maximumFractionDigits: 1 });
+    const known = group.buckets.filter(bucket => !bucket.disabled && bucket.remainingFraction !== null)
+      .toSorted((a, b) => Number(b.window === "5h") - Number(a.window === "5h"));
+    const labels = known.map(bucket => `${bucket.window === "5h" ? "5h" : bucket.window === "weekly" ? "週" : bucket.name}${new Intl.NumberFormat("zh-TW", { style: "percent", maximumFractionDigits: bucket.remainingFraction > 0 && bucket.remainingFraction < .01 ? 1 : 0 }).format(bucket.remainingFraction)}`);
+    if (labels.length) result.display_name += ` · ${labels.join(" ")}`;
+    result.description += `\nAntigravity ${group.name} 剩餘額度（${usage.fetchedAt}）：\n` + group.buckets.map(bucket =>
+      `${bucket.name}: ${bucket.disabled ? "未啟用" : bucket.remainingFraction === null ? "未知" : percentage.format(bucket.remainingFraction)}${bucket.resetTime ? `；重置 ${bucket.resetTime}` : ""}`).join("\n");
+  }
   return result;
 }
 
-export function buildCodexCatalog(models) {
-  const source = nativeCatalog();
+export function buildCodexCatalog(models, source = nativeCatalog(), usage) {
   const template = nativeTemplate(source);
   const preserved = source.models.filter(model => {
     const slug = modelSlug(model);
     return slug && !slug.startsWith(MODEL_PREFIX)
       && !slug.startsWith("freebuff/")
       && !slug.startsWith("gemini-web/");
-  });
+  }).toSorted((a, b) => (a.priority ?? 0) - (b.priority ?? 0))
+    // Native protocol flags also control token accounting; keep the upstream contract.
+    .map((model, priority) => ({ ...model, priority }));
+  const groups = groupAgyModels(models);
+  const ordered = [...groups.filter(model => model.id.startsWith("gemini-")), ...groups.filter(model => model.id.startsWith("claude-"))];
+  const visible = ordered.map((model, index) => ({ ...buildModel(template, model, usage), priority: preserved.length + index }));
+  // Keep existing chats using a suffixed ID working without listing each effort as a model.
+  const aliases = ordered.flatMap((group, index) => group.variants.filter(variant => variant.id !== group.id).map(variant => ({
+    ...visible[index],
+    slug: routeId(variant.id),
+    visibility: "hide",
+    default_reasoning_level: variant.effort,
+  })));
   return {
     ...structuredClone(source),
-    models: [...preserved, ...models.map(model => buildModel(template, model))],
+    models: [...preserved, ...visible, ...aliases],
   };
 }

@@ -122,7 +122,7 @@ function stageImageFile(filePath) {
   }
 }
 
-export function formatImagePart(part) {
+export function formatImagePart(part, inspect = true) {
   if (!part || typeof part !== "object") return "[Image attachment]";
   const name = part.name || part.filename || part.fileName;
   let filePath = part.file_path || part.path || part.image_path || part.filePath;
@@ -156,20 +156,22 @@ export function formatImagePart(part) {
     const stagedPath = stageImageFile(filePath);
     if (stagedPath) filePath = stagedPath;
     const label = name && name !== filePath ? ` (${name})` : "";
+    if (!inspect) return `[Historical image attachment: ${filePath}${label}]`;
     return `[Image attachment: ${filePath}${label}]\nBefore answering, you MUST call the view_file tool for this exact path and inspect the image. Treat this as a visual attachment, not just a text path.`;
   }
 
   if (url && (url.startsWith("http://") || url.startsWith("https://"))) {
     const label = name ? ` (${name})` : "";
+    if (!inspect) return `[Historical image URL: ${url}${label}]`;
     return `[Image URL: ${url}${label}]\nBefore answering, you MUST use your browser/image reading tool to inspect this exact image URL. Treat this as a visual attachment, not just a text URL.`;
   }
 
   return name ? `[Image attachment: ${name}]` : "[Image attachment]";
 }
 
-function formatToolPart(part) {
+function formatToolPart(part, inspectImages = true) {
   if (part.type === "custom_tool_call_output" || part.type === "function_call_output") {
-    const output = typeof part.output === "string" ? part.output : contentText(part.output) || JSON.stringify(part.output || "");
+    const output = typeof part.output === "string" ? part.output : contentText(part.output, inspectImages) || JSON.stringify(part.output || "");
     return `Tool output (${part.name || part.call_id || "tool"}):\n${output}`;
   }
   if (part.type === "custom_tool_call" || part.type === "function_call") {
@@ -179,7 +181,7 @@ function formatToolPart(part) {
   return JSON.stringify(part);
 }
 
-function contentText(content) {
+function contentText(content, inspectImages = true) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content.map(part => {
@@ -189,10 +191,10 @@ function contentText(content) {
     if (typeof part.input_text === "string") return part.input_text;
     if (typeof part.output_text === "string") return part.output_text;
     if (part.type === "input_image" || part.type === "image" || part.type === "image_url") {
-      return formatImagePart(part);
+      return formatImagePart(part, inspectImages);
     }
     if (part.type === "function_call" || part.type === "function_call_output" || part.type === "custom_tool_call" || part.type === "custom_tool_call_output") {
-      return formatToolPart(part);
+      return formatToolPart(part, inspectImages);
     }
     return "";
   }).filter(Boolean).join("\n");
@@ -202,14 +204,27 @@ function hasImagePart(value) {
   if (Array.isArray(value)) return value.some(hasImagePart);
   if (!value || typeof value !== "object") return false;
   if (["input_image", "image", "image_url"].includes(value.type)) return true;
-  return ["content", "input", "summary"].some(key => hasImagePart(value[key]));
+  return ["content", "input", "summary", "output"].some(key => hasImagePart(value[key]));
+}
+
+export function latestUserMessage(payload) {
+  if (typeof payload.input === "string") return payload.input;
+  return Array.isArray(payload.input) ? payload.input.findLast(item => item?.role === "user") : undefined;
 }
 
 export function hasImageInput(payload) {
-  return hasImagePart(payload?.input);
+  return hasImagePart(currentVisualInput(payload));
 }
 
-function itemText(item) {
+export function currentVisualInput(payload) {
+  const current = latestUserMessage(payload);
+  const input = Array.isArray(payload.input) ? payload.input : [];
+  const lastCall = input.findLastIndex(item => ["function_call", "custom_tool_call", "tool_search_call"].includes(item.type));
+  return [current, ...input.slice(Math.max(lastCall, input.lastIndexOf(current)) + 1)
+    .filter(item => ["function_call_output", "custom_tool_call_output"].includes(item.type))].filter(Boolean);
+}
+
+export function itemText(item, inspectImages = true) {
   if (typeof item === "string") return item;
   if (!item || typeof item !== "object") return "";
   if (typeof item.text === "string") return item.text;
@@ -218,37 +233,63 @@ function itemText(item) {
     return summary === null ? "" : `Compaction summary:\n${summary}`;
   }
   if (item.type === "reasoning") return contentText(item.summary) || contentText(item.content);
-  if (item.type === "message") return contentText(item.content);
+  if (item.type === "message") return contentText(item.content, inspectImages);
   if (item.type === "input_text") return item.text || "";
   if (item.type === "input_image" || item.type === "image" || item.type === "image_url") {
-    return formatImagePart(item);
+    return formatImagePart(item, inspectImages);
   }
   if (item.type === "custom_tool_call_output" || item.type === "function_call_output" || item.type === "custom_tool_call" || item.type === "function_call") {
-    return formatToolPart(item);
+    return formatToolPart(item, inspectImages);
   }
-  return contentText(item.content);
+  if (["tool_search_call", "tool_search_output", "additional_tools"].includes(item.type)) return JSON.stringify(item);
+  return contentText(item.content, inspectImages);
 }
 
-export function buildAgyPrompt(payload) {
+export function buildAgyPrompt(payload, { imageContext = "", hostTools } = {}) {
   const sections = [];
   const input = payload.input;
+  const current = latestUserMessage(payload);
   const systemInstructions = [];
-  if (hasImagePart(input)) {
+  if (!hostTools && hasImageInput(payload)) {
     systemInstructions.push("MANDATORY IMAGE PREFLIGHT: this request includes visual attachment(s). Before answering the user's request, you MUST inspect every [Image attachment: ...] by calling the view_file tool with its exact path, and every [Image URL: ...] with the browser/image reading tool. Wait for those tool results before composing the answer. Do not say an image could not be read until you have performed the corresponding tool call.");
   }
   if (payload.instructions) systemInstructions.push(itemText(payload.instructions));
+  systemInstructions.push(
+    "CODEX WORKFLOW AUTHORITY: Follow the current Codex developer instructions, collaboration mode and explicit user constraints. Do not impose Antigravity's /plan, implementation_plan.md Artifact, UserFacing/RequestFeedback or walkthrough approval workflow. References to those in historical summaries do not establish a current user requirement. In Codex Default mode, carry out the authorized task; in Codex Plan mode or an explicitly read-only task, present the requested analysis or plan without making unauthorized edits. Preserve all actual user approval requirements.",
+    "Codex 對話語言：開始前的說明、中途進度、最後回覆，一律使用繁體中文及台灣慣用語（zh-TW），採用『檔案、資料夾、套件、軟體、程式、資訊、資料、滑桿、推播、重新整理』等台灣寫法。程式碼、檔名、API 名稱與使用者指定的逐字內容保留原樣。",
+    "CURRENT USER REQUEST is the active request. Completed tool transcripts are evidence for this work. Answer directly when the available evidence is sufficient.",
+    "Before the first tool call for a new user request, explain in one short public zh-TW message what you will do and why. During longer work, report concrete findings, decisions or blockers and the next action at meaningful stages. Keep the user informed about once a minute while work continues. Give a separate concise final answer.",
+    "Tool transcripts in the supplied conversation are prior history; use the tools available in this session rather than trying to recreate the host's internal tool interfaces through shell commands.",
+    "Continue from completed checks in tool results and summaries. Gather only evidence needed for the next decision, using targeted searches or file ranges. Recheck only when relevant data changed, a necessary range is missing, or a status change affects what you can do next. Check a pending CI job when its result is needed; avoid repeating the status query in unrelated tool batches. Once evidence supports the next authorized change or the answer, take that step.",
+  );
+  if (hostTools) {
+    systemInstructions.push(
+      "CODEX NATIVE TOOL EXECUTION: You are the reasoning model inside Codex. NEVER call Antigravity's own tools, shell, browser, subagents, or filesystem tools. They are disabled. All operations MUST be requested through the Codex tool list below so Codex enforces the user's current permissions, sandbox, approval reviewer and custom rules.",
+      "Return a JSON object with message (public zh-TW text) and tool_calls (array of {name, arguments}). On routine continuations with no new finding or milestone, set message to an empty string and issue only the tools needed for the current step. arguments is a JSON string for function tools; for custom tools it is the exact raw input required by their grammar. Use the exact tool key, including its namespace. Use tool_search to discover connected tools when needed. For a final answer, put the answer in message and use an empty tool_calls array. Do not print this protocol to the user.",
+      "Public message style: use one or two natural zh-TW sentences about the purpose, findings and next action. Avoid tool names, commands, long paths and internal implementation details unless the user needs them. For native tool calls, use Codex's current working directory by default; do not substitute the Bridge installation directory or the user's home directory.",
+      `Codex tools for this request:\n${JSON.stringify(hostTools)}`,
+    );
+  }
   if (systemInstructions.length) sections.push(`System instructions:\n${systemInstructions.join("\n\n")}`);
-  if (typeof input === "string") {
-    sections.push(`User:\n${input}`);
-  } else if (Array.isArray(input)) {
-    for (const item of input) {
-      const text = itemText(item);
+  if (Array.isArray(input)) {
+    sections.push("Conversation history:");
+    const visualInput = hostTools ? [] : currentVisualInput(payload);
+    const currentIndex = hostTools ? input.lastIndexOf(current) : -1;
+    for (const [index, item] of input.entries()) {
+      // Put the latest user request at the end. Keep calls and results in their original order.
+      if (index === currentIndex) {
+        if (index < input.length - 1) sections.push("CURRENT TURN ACTIVITY — continue from completed tool results:");
+        continue;
+      }
+      const text = itemText(item, visualInput.includes(item));
       if (!text) continue;
       const role = item?.role || (item?.type === "message" ? "user" : "context");
       sections.push(`${String(role).replace(/^./, char => char.toUpperCase())}:\n${text}`);
     }
-  } else if (input !== undefined) {
+  } else if (input !== undefined && typeof input !== "string") {
     sections.push(`User:\n${JSON.stringify(input)}`);
   }
+  if (imageContext) sections.push(`Current attachment observations (reference only):\n${imageContext}`);
+  if (current !== undefined) sections.push(`CURRENT USER REQUEST — answer this turn:\n${itemText(current, !hostTools)}`);
   return sections.join("\n\n").trim();
 }

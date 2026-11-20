@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { agyVersion } from "./agy.mjs";
 import { appHome, catalogPath, codexConfigPath, integrationStatePath, loadConfig, resolveAgyExecutable, resolveCwd, saveConfig } from "./config.mjs";
 import { buildCodexCatalog, discoverAgyModels } from "./models.mjs";
 import { createBridgeServer, listenBridge } from "./server.mjs";
 import { installService, uninstallService } from "./service.mjs";
+import { createWorkspacePolicy } from "./workspace.mjs";
 
 function parseArgs(args) {
   const options = {};
@@ -45,7 +47,7 @@ async function freshConfig(options) {
 
 async function refreshModels(config) {
   try {
-    const models = await discoverAgyModels(config.agyPath);
+    const models = await discoverAgyModels(config.agyPath, config.cwd);
     const updated = { ...config, models, lastModelsRefresh: new Date().toISOString() };
     saveConfig(updated);
     return updated;
@@ -149,10 +151,11 @@ function atomicWrite(path, data) {
 }
 
 async function setup(options) {
-  let config = await freshConfig(options);
-  config = await refreshModels(config);
-  const route = `http://${config.host}:${config.port}/v1`;
   const configPath = codexConfigPath();
+  let config = { ...await freshConfig(options), codexHome: dirname(configPath) };
+  if (options.cwd) config.allowedWorkspaceRoots = [config.cwd];
+  createWorkspacePolicy(config);
+  const route = `http://${config.host}:${config.port}/v1`;
   const configExists = existsSync(configPath);
   const currentText = configExists ? readFileSync(configPath, "utf8") : "";
   const currentRoute = getTopLevelAssignment(currentText, "openai_base_url");
@@ -167,7 +170,11 @@ async function setup(options) {
     throw new Error(`Codex already routes through ${routeInUse}. Use --replace-codex-route to switch it reversibly.`);
   }
 
+  config = await refreshModels(config);
+  if (!config.models.length) throw new Error("No supported models returned by agy models. Check your Antigravity login.");
+
   const backupPath = existingState?.backupPath || join(appHome(), "codex", "config.toml.before-antigravity");
+  const hadConfig = existingState?.hadConfig ?? configExists;
   if (!existingState && configExists) {
     mkdirSync(dirname(backupPath), { recursive: true, mode: 0o700 });
     copyFileSync(configPath, backupPath);
@@ -177,27 +184,46 @@ async function setup(options) {
   const managedCatalogPath = catalogPath();
   atomicWrite(managedCatalogPath, `${JSON.stringify(managedCatalog, null, 2)}\n`);
   let patched = replaceTopLevelAssignment(currentText, "openai_base_url", route);
-  patched = replaceTopLevelAssignment(patched, "model_catalog_json", managedCatalogPath);
+  const patchedLines = patched.split(/\r?\n/);
+  const topLevelLimit = topLevelEnd(patchedLines);
+  patched = patchedLines.filter((line, index) => index >= topLevelLimit || !/^\s*model_catalog_json\s*=/.test(line)).join("\n");
   // Codex chooses the Responses transport per provider, not per catalog row. The local router
   // therefore accepts WebSocket requests and decides by model: native GPT frames are forwarded
   // to ChatGPT, while antigravity/* frames are translated to AGY CLI turns.
-  patched = ensureRouterProvider(patched, provider, route);
-  atomicWrite(configPath, patched);
+  if (provider && provider !== "openai") patched = ensureRouterProvider(patched, provider, route);
+
+  const service = installService(config);
+  if (process.platform === "win32") {
+    const deadline = Date.now() + 20_000;
+    let ready = false;
+    while (!ready && Date.now() < deadline) {
+      try {
+        const response = await fetch(`http://${config.host}:${config.port}/healthz`, { signal: AbortSignal.timeout(1000) });
+        const health = await response.json();
+        ready = response.ok && health.service === "codex-bridge-antigravity"
+          && health.agy_workspace_ok && health.model_count > 0 && health.cwd === config.cwd;
+      } catch { /* The scheduled task may still be starting. */ }
+      if (!ready) await delay(250);
+    }
+    if (!ready) {
+      if (service.newlyRegistered) uninstallService();
+      throw new Error(`Windows bridge did not become healthy. Inspect ${join(appHome(), "logs")}.`);
+    }
+  }
   const state = {
     version: 1,
     configPath,
     route,
     catalogPath: managedCatalogPath,
-    hadConfig: configExists,
-    backupPath: configExists && existsSync(backupPath) ? backupPath : null,
+    hadConfig,
+    backupPath: hadConfig && existsSync(backupPath) ? backupPath : null,
     installedAt: new Date().toISOString(),
   };
   atomicWrite(statePath, `${JSON.stringify(state, null, 2)}\n`);
-  saveConfig(config);
-  const service = installService(config);
+  atomicWrite(configPath, patched);
   console.log(`Codex route installed: ${route}`);
   console.log(`Models installed: ${config.models.length}`);
-  if (service.installed) console.log(`Background service installed: ${service.plistPath}`);
+  if (service.installed) console.log(`Background service installed: ${service.plistPath || service.taskName}`);
   console.log(`Codex restart required. To restore the previous route: codex-bridge-antigravity disconnect`);
 }
 
@@ -205,7 +231,6 @@ function disconnect() {
   const statePath = integrationStatePath();
   if (!existsSync(statePath)) throw new Error("Antigravity Codex integration is not installed");
   const state = JSON.parse(readFileSync(statePath, "utf8"));
-  uninstallService();
   const current = existsSync(state.configPath) ? readFileSync(state.configPath, "utf8") : "";
   const currentRoute = getTopLevelAssignment(current, "openai_base_url");
   if (currentRoute && currentRoute !== state.route) throw new Error("Codex route changed after setup; refusing to overwrite it");
@@ -217,6 +242,7 @@ function disconnect() {
     unlinkSync(state.configPath);
     console.log("Removed the Codex config created by Antigravity setup");
   }
+  uninstallService();
   unlinkSync(statePath);
 }
 
@@ -226,7 +252,7 @@ async function doctor(options) {
   let models;
   try {
     version = await agyVersion(config.agyPath);
-    models = await discoverAgyModels(config.agyPath);
+    models = await discoverAgyModels(config.agyPath, config.cwd);
   } catch (error) {
     console.log(`✗ AGY CLI: ${error.message}`);
     process.exitCode = 1;
@@ -256,8 +282,7 @@ async function refreshCatalog(options) {
 }
 
 async function serve(options) {
-  let config = await freshConfig(options);
-  config = await refreshModels(config);
+  const config = await freshConfig(options);
   try {
     const managedCatalog = buildCodexCatalog(config.models);
     atomicWrite(catalogPath(), `${JSON.stringify(managedCatalog, null, 2)}\n`);
@@ -268,26 +293,49 @@ async function serve(options) {
   await listenBridge(server, config);
   console.log(`codex-bridge-antigravity listening on http://${config.host}:${config.port}/v1`);
   console.log(`AGY: ${config.agyPath} | cwd: ${config.cwd} | mode: ${config.mode}`);
-  const shutdown = () => server.close(() => process.exit(0));
-  process.once("SIGINT", shutdown);
-  process.once("SIGTERM", shutdown);
+  // Bind before contacting AGY: a failed login/model discovery must not disable GPT.
+  void discoverAgyModels(config.agyPath, config.cwd).then(models => {
+    config.models.splice(0, config.models.length, ...models);
+    saveConfig({ ...config, lastModelsRefresh: new Date().toISOString() });
+    atomicWrite(catalogPath(), `${JSON.stringify(buildCodexCatalog(models), null, 2)}\n`);
+  }).catch(error => console.error(`Antigravity model refresh failed; native routing remains available: ${error.message}`));
+  const shutdown = async (timeoutMs = 30_000) => {
+    const result = await server.shutdown(timeoutMs);
+    console.log(JSON.stringify({ event: "graceful_shutdown_complete", pid: process.pid, ...result }));
+    process.exit(0);
+  };
+  process.on("message", message => {
+    if (message?.type === "watchdog.status" && process.connected) {
+      process.send({ type: "watchdog.status", id: message.id, pid: process.pid, lifecycle: server.bridgeLifecycle.snapshot() });
+    } else if (message?.type === "watchdog.shutdown") {
+      void shutdown(message.timeoutMs);
+    }
+  });
+  process.once("SIGINT", () => void shutdown());
+  process.once("SIGTERM", () => void shutdown());
 }
 
 async function main() {
   const { positional, options } = parseArgs(process.argv.slice(2));
   const command = positional[0] || "doctor";
   if (command === "version") {
-    console.log("codex-bridge-antigravity 0.1.0");
+    const { name, version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    console.log(`${name} ${version}`);
     return;
   }
   if (command === "models") {
     const config = await freshConfig(options);
-    const models = await discoverAgyModels(config.agyPath);
+    const models = await discoverAgyModels(config.agyPath, config.cwd);
     for (const model of models) console.log(`${model.id}\t${model.displayName}`);
     return;
   }
   if (command === "doctor") return doctor(options);
   if (command === "serve") return serve(options);
+  if (command === "service-install") {
+    const service = installService(await freshConfig(options));
+    console.log(JSON.stringify(service));
+    return;
+  }
   if (command === "setup") return setup(options);
   if (command === "refresh-catalog") return refreshCatalog(options);
   if (command === "disconnect") return disconnect();

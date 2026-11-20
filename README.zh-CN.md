@@ -1,5 +1,7 @@
 # codex-bridge-antigravity
 
+此页为上游文档。Windows x64 版的安装脚本与 Codex 提示词见[安装指南](README.zh-TW.md)。
+
 [English](README.md) | [繁體中文](README.zh-TW.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
 轻量级本地 OpenAI Responses API 桥接器，将 Google Antigravity 官方 CLI (`agy`) 无缝集成至 OpenAI Codex（支持 Desktop 与 CLI），同时完整保留原生 GPT 模型的路由与认证机制。
